@@ -44,24 +44,25 @@ class my_sememe_tree:
         print(" "*start_space, end="")
         prefix = f"|--{self.line_type}-->"
         print(f"{prefix}{self.info['sememe']}",end="")
-        if self.info["des"] != "":
-            print(self.info["des"],end="")
         print("")
         for child in self.childs:
             child.print(start_space = start_space + len(prefix))
 
 
-    def to_tree_sequence(self):
+    def to_tree_sequence(self,add_eos = False):
         tree_sequence = []
 
         tree_sequence.append(self.info["sememe"])
         for child in self.childs:
-            tree_sequence.extend(child.to_tree_sequence())
-            tree_sequence.append(sememe("BACK|[BACK"))
-
+            tree_sequence.extend(child.to_tree_sequence(add_eos = False))
+            tree_sequence.append(sememe("BACK|BACK"))
+        if add_eos:
+            tree_sequence.append(sememe("EOS|EOS"))
         return tree_sequence
     
 
+def pseudo_tokenizer(sememes,):
+    pass
 
 def parse_sememe(global_data,sememes, line: str):
     # print(line)
@@ -175,6 +176,13 @@ def get_sememe_trees():
                 # print(line.strip())
                 pass
     print(f"ratio={good/total}, good={good}, total={total}")
+
+
+    pad_sememe = sememe("PAD|PAD")
+    sememes[pad_sememe.__repr__()] = pad_sememe
+
+    eos_sememe = sememe("EOS|EOS")
+    sememes[eos_sememe.__repr__()] = eos_sememe
 
     print(f"find {len(sememes)} sememes")
 

@@ -14,7 +14,7 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
-from mingpt.utils import CfgNode as CN
+from model.minGPT.mingpt.utils import CfgNode as CN
 
 # -----------------------------------------------------------------------------
 
@@ -49,7 +49,7 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
 
-    def forward(self, x):
+    def forward(self, x, attention_mask=None):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
@@ -60,12 +60,29 @@ class CausalSelfAttention(nn.Module):
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+        use_mask = self.bias[:,:,:T,:T]
+        if attention_mask != None:
+            '''
+            1代表有效位置,传入 [B, T]
+            现在是(B, nh, T, T)的attention，需要让有效token看不到无效token，无效token看不到所有token
+            '''
+            # print(attention_mask)
+            use_attention_mask = attention_mask.clone().detach()
+            use_attention_mask = use_attention_mask.unsqueeze(-1).expand(B,T,T)
+            use_attention_mask = use_attention_mask.unsqueeze(1).expand(B,att.shape[1],T,T)
+            # print(use_attention_mask)
+            use_mask = use_mask * use_attention_mask #只要一个是0就是0
+        att = att.masked_fill(use_mask == 0, float('-inf'))
+        # print(att)
+        # print(att)
+        # exit()
         att = F.softmax(att, dim=-1)
+        att = att.masked_fill(use_mask == 0, 0.0)
         att = self.attn_dropout(att)
         y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
-
+        # print(y)
+        # exit()
         # output projection
         y = self.resid_dropout(self.c_proj(y))
         return y
@@ -87,8 +104,8 @@ class Block(nn.Module):
         m = self.mlp
         self.mlpf = lambda x: m.dropout(m.c_proj(m.act(m.c_fc(x)))) # MLP forward
 
-    def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
+    def forward(self, x,attention_mask=None):
+        x = x + self.attn(self.ln_1(x),attention_mask=attention_mask)
         x = x + self.mlpf(self.ln_2(x))
         return x
 
@@ -103,6 +120,7 @@ class GPT(nn.Module):
         C.n_layer = None
         C.n_head = None
         C.n_embd =  None
+        C.embedding_dim = None
         # these options must be filled in externally
         C.vocab_size = None
         C.block_size = None
@@ -142,12 +160,16 @@ class GPT(nn.Module):
             }[config.model_type])
 
         self.transformer = nn.ModuleDict(dict(
-            wte = nn.Embedding(config.vocab_size, config.n_embd),
+            wte = nn.Embedding(config.vocab_size, config.embedding_dim),
+
+            
             wpe = nn.Embedding(config.block_size, config.n_embd),
             drop = nn.Dropout(config.embd_pdrop),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f = nn.LayerNorm(config.n_embd),
         ))
+
+        self.embedding_converter = nn.Linear(config.embedding_dim, config.n_embd, bias=False)
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
         # init all weights, and apply a special scaled init to the residual projections, per GPT-2 paper
@@ -212,7 +234,7 @@ class GPT(nn.Module):
 
         return model
 
-    def configure_optimizers(self, train_config):
+    def configure_optimizers(self, learning_rate, weight_decay, betas):
         """
         This long function is unfortunately doing something very simple and is being very defensive:
         We are separating out all parameters of the model into two buckets: those that will experience
@@ -251,24 +273,27 @@ class GPT(nn.Module):
 
         # create the pytorch optimizer object
         optim_groups = [
-            {"params": [param_dict[pn] for pn in sorted(list(decay))], "weight_decay": train_config.weight_decay},
+            {"params": [param_dict[pn] for pn in sorted(list(decay))], "weight_decay": weight_decay},
             {"params": [param_dict[pn] for pn in sorted(list(no_decay))], "weight_decay": 0.0},
         ]
-        optimizer = torch.optim.AdamW(optim_groups, lr=train_config.learning_rate, betas=train_config.betas)
+        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(betas, 0.999))
         return optimizer
 
-    def forward(self, idx, targets=None):
-        device = idx.device
-        b, t = idx.size()
+    def forward(self, input_ids, attention_mask=None, targets=None):
+        device = input_ids.device
+        b, t = input_ids.size()
         assert t <= self.block_size, f"Cannot forward sequence of length {t}, block size is only {self.block_size}"
         pos = torch.arange(0, t, dtype=torch.long, device=device).unsqueeze(0) # shape (1, t)
 
         # forward the GPT model itself
-        tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
+        tok_emb = self.transformer.wte(input_ids) # token embeddings of shape (b, t, n_embd)
+        tok_emb = self.embedding_converter(tok_emb)
+
+
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (1, t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
         for block in self.transformer.h:
-            x = block(x)
+            x = block(x,attention_mask=attention_mask)
         x = self.transformer.ln_f(x)
         logits = self.lm_head(x)
 
